@@ -1,0 +1,30 @@
+# Secrets — NEVER commit. Use .env.example as the template.
+.env
+*.env
+!.env.example
+.tokens
+
+# Local model / provider caches
+.playwright-mcp/
+
+# Generated project output and run state
+projects/*/state.json
+projects/*/src/
+logs/*.jsonl
+logs/*.json
+
+# OS / editor cruft
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Large local artifacts
+*.png
+*.heic
+*.log
+logs/
+__pycache__/
+.venv/
+state/
+*.state
