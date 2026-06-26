@@ -9,7 +9,7 @@ The orchestrator can run itself on a timer via launchd. The plist lives in
 Every **30 minutes** (`StartInterval=1800`) launchd runs:
 
 ```bash
-cd "/Users/marc/Documents/Claude/Projects/AI workflow"
+cd "/Users/marc/Development/Project/localsmith-engine"
 shopt -s nullglob
 bin/orchestrate.sh queue/*.md
 ```
@@ -105,11 +105,11 @@ Useful keys:
 <array>
     <string>/bin/bash</string>
     <string>-lc</string>        <!-- -l loads your login profile (PATH, etc.) -->
-    <string>cd "/Users/marc/Documents/Claude/Projects/AI workflow" &amp;&amp; ...</string>
+    <string>cd "/Users/marc/Development/Project/localsmith-engine" &amp;&amp; ...</string>
 </array>
 
 <key>WorkingDirectory</key>     <!-- safety; bash -c already does cd, but belt-and-braces -->
-<string>/Users/marc/Documents/Claude/Projects/AI workflow</string>
+<string>/Users/marc/Development/Project/localsmith-engine</string>
 
 <key>StandardOutPath</key>      <!-- launchd captures stdout/stderr here -->
 <string>.../logs/launchd.out</string>

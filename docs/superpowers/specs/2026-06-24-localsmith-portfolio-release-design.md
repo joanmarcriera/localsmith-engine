@@ -30,7 +30,7 @@ Groq/Cerebras/Gemini-flash/OpenRouter-free/…). This is a *stronger* story, not
 ## Deliverables
 
 ### 1. Public engine repo — `joanmarcriera/localsmith` (public, MIT)
-- **Clean extraction** from `~/Documents/Claude/Projects/AI workflow` into a *fresh* repo — no
+- **Clean extraction** from `~/Development/Project/localsmith-engine` into a *fresh* repo — no
   secret-bearing git history. Scrub: the dead `ZAI_API_KEY` + `BRAVE_API_SEARCH` in `.env`
   (gitignore `.env`, ship `.env.example`), any personal paths in the launchd plist, real hostnames.
 - `LICENSE` (MIT), `.gitignore`, `CONTRIBUTING.md` (light), the existing setup wizard.

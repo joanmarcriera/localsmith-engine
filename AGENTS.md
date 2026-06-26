@@ -10,7 +10,7 @@ Opus/Sonnet and supersedes the older local handoff notes.
 
 Important local conventions:
 
-- The workspace is `/Users/marc/Documents/Claude/Projects/AI workflow`.
+- The workspace is `/Users/marc/Development/Project/localsmith-engine`.
 - This workspace is not currently a Git repository.
 - `bin/orchestrate.sh` is the main entry point and now loads `.env` before
   dispatching stages.

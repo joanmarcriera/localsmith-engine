@@ -8,8 +8,8 @@
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.marc.ai-workflow.plist
 
   Tail logs:
-    tail -f "/Users/marc/Documents/Claude/Projects/AI workflow/logs/launchd.out" \
-            "/Users/marc/Documents/Claude/Projects/AI workflow/logs/launchd.err"
+    tail -f "/Users/marc/Development/Project/localsmith-engine/logs/launchd.out" \
+            "/Users/marc/Development/Project/localsmith-engine/logs/launchd.err"
 
   Pause / resume / remove:
     launchctl kickstart -k gui/$(id -u)/com.marc.ai-workflow            # force run now
@@ -31,11 +31,11 @@
     <array>
         <string>/bin/bash</string>
         <string>-lc</string>
-        <string>cd "/Users/marc/Documents/Claude/Projects/AI workflow" &amp;&amp; shopt -s nullglob &amp;&amp; bin/orchestrate.sh queue/*.md</string>
+        <string>cd "/Users/marc/Development/Project/localsmith-engine" &amp;&amp; shopt -s nullglob &amp;&amp; bin/orchestrate.sh queue/*.md</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/marc/Documents/Claude/Projects/AI workflow</string>
+    <string>/Users/marc/Development/Project/localsmith-engine</string>
 
     <key>StartInterval</key>
     <integer>1800</integer>
@@ -44,10 +44,10 @@
     <false/>
 
     <key>StandardOutPath</key>
-    <string>/Users/marc/Documents/Claude/Projects/AI workflow/logs/launchd.out</string>
+    <string>/Users/marc/Development/Project/localsmith-engine/logs/launchd.out</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/marc/Documents/Claude/Projects/AI workflow/logs/launchd.err</string>
+    <string>/Users/marc/Development/Project/localsmith-engine/logs/launchd.err</string>
 
     <key>EnvironmentVariables</key>
     <dict>

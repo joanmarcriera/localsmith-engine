@@ -8,7 +8,7 @@ Audience: Claude Opus/Sonnet taking over the local `AI workflow` workspace.
 Workspace:
 
 ```bash
-cd "/Users/marc/Documents/Claude/Projects/AI workflow"
+cd "/Users/marc/Development/Project/localsmith-engine"
 ```
 
 This workspace is not a Git repository. Treat changes as local workspace edits,
