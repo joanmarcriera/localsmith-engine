@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""stats — one-screen cross-project pipeline health for the AI workflow orchestrator.
+
+WHAT: Reads existing logs (projects/*/state.json, logs/state-events.jsonl,
+logs/tokens.jsonl, logs/costs.json) and prints a terminal-friendly summary.
+No external deps, no API calls.
+
+WHY: The web dashboard answers "what is one project doing right now?"; this CLI
+answers "across all projects in the last N days, what is failing, where does my
+money go, and which steps are slow?" Different audience (SSH/terminal), same data.
+
+KEY DECISIONS:
+- Pure stdlib. Same dependency-free posture as the rest of bin/.
+- Median duration over mean: pipeline times are skewed by cold-load tails.
+- Reads tokens.jsonl line-by-line, not all-at-once, so it scales.
+- Default window is 7 days; --days N overrides.
+
+Usage:
+  bin/stats                  # last 7 days, all projects
+  bin/stats --days 30        # wider window
+  bin/stats --json           # machine-readable (for piping)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import statistics
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+STEPS = ["scaffold", "plan", "implement", "verify"]
+
+
+def _iso(s: str) -> datetime | None:
+    """Parse an ISO timestamp; return None on failure (logs may have edge cases)."""
+    try:
+        return datetime.fromisoformat(s.rstrip("Z").replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _ago(dt: datetime, now: datetime) -> str:
+    """Format a delta as a short relative string: 2m, 4h, 3d."""
+    secs = int((now - dt).total_seconds())
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    if secs < 86400:
+        return f"{secs // 3600}h"
+    return f"{secs // 86400}d"
+
+
+# ---------- collectors ----------
+
+def collect_projects() -> list[dict]:
+    """Read every projects/<slug>/state.json. Tolerant of missing/malformed."""
+    out: list[dict] = []
+    pdir = ROOT / "projects"
+    if not pdir.is_dir():
+        return out
+    for p in sorted(pdir.iterdir()):
+        sp = p / "state.json"
+        if not sp.exists():
+            continue
+        try:
+            out.append(json.loads(sp.read_text()))
+        except (OSError, json.JSONDecodeError):
+            continue
+    return out
+
+
+def collect_state_events(since: datetime) -> list[dict]:
+    """Filter logs/state-events.jsonl to records on or after `since`."""
+    path = ROOT / "logs" / "state-events.jsonl"
+    if not path.exists():
+        return []
+    rows = []
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = _iso(rec.get("ts", ""))
+            if ts and ts >= since:
+                rec["_ts"] = ts
+                rows.append(rec)
+    return rows
+
+
+def collect_tokens(since: datetime) -> list[dict]:
+    """Filter logs/tokens.jsonl to records on or after `since`."""
+    path = ROOT / "logs" / "tokens.jsonl"
+    if not path.exists():
+        return []
+    rows = []
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = _iso(rec.get("ts", ""))
+            if ts and ts >= since:
+                rec["_ts"] = ts
+                rows.append(rec)
+    return rows
+
+
+# ---------- derivations ----------
+
+def step_durations(projects: list[dict]) -> dict[str, list[float]]:
+    """Per-step duration in seconds, derived from state.step_entered_at.
+
+    A step's duration = next_step_entered_at - this_step_entered_at. For the
+    current (incomplete) step we use updated_at as the right boundary so the
+    number means 'time so far'.
+    """
+    durations: dict[str, list[float]] = defaultdict(list)
+    for s in projects:
+        entered = s.get("step_entered_at") or {}
+        order = STEPS  # the canonical pipeline order
+        # Build a list of (step, ts) in order they were entered.
+        timeline = [(step, _iso(entered.get(step, ""))) for step in order if entered.get(step)]
+        if not timeline:
+            continue
+        # Append a terminal boundary so the last entered step has a duration.
+        cs = s.get("current_step")
+        if cs == "done":
+            terminal = _iso(s.get("updated_at", ""))
+        else:
+            terminal = _iso(s.get("updated_at", "")) or datetime.now(timezone.utc)
+        timeline.append(("__end__", terminal))
+        for i in range(len(timeline) - 1):
+            step, t0 = timeline[i]
+            _, t1 = timeline[i + 1]
+            if t0 and t1 and t1 > t0:
+                durations[step].append((t1 - t0).total_seconds())
+    return durations
+
+
+def step_outcomes(events: list[dict]) -> dict[str, dict]:
+    """For each step compute ok, err, and runs = ok + err.
+
+    - ok  = distinct (project, step) pairs that appeared in `completed[]` at any point.
+    - err = error events whose `step` field matches this step (one per error log line;
+      retries surface as multiple error events).
+    - runs = ok + err. Includes retries; counts every attempt.
+
+    NB: scaffold completes during state.py init so it never appears as `current_step`
+    in events — we still credit it via the completed-list scan, which is correct.
+    """
+    out: dict[str, dict] = {s: {"runs": 0, "ok": 0, "err": 0} for s in STEPS}
+    completed_seen: set[tuple[str, str]] = set()
+    for rec in events:
+        proj = rec.get("project") or ""
+        step = rec.get("step") or ""
+        err = rec.get("last_error")
+        completed = rec.get("completed") or []
+        if err and step in STEPS:
+            out[step]["err"] += 1
+        for s in completed:
+            if s in STEPS and (proj, s) not in completed_seen:
+                out[s]["ok"] += 1
+                completed_seen.add((proj, s))
+    for s in STEPS:
+        out[s]["runs"] = out[s]["ok"] + out[s]["err"]
+    return out
+
+
+def provider_summary(tokens: list[dict], costs: dict) -> list[dict]:
+    """Aggregate per-provider usage from tokens.jsonl.
+
+    Cost is recomputed from logs/costs.json so the dashboard, stats, and bin/ai
+    all agree on rates.
+    """
+    agg: dict[str, dict] = defaultdict(lambda: {"calls": 0, "in": 0, "out": 0, "usd": 0.0, "sec": 0.0})
+    for t in tokens:
+        p = t.get("provider", "?")
+        agg[p]["calls"] += 1
+        agg[p]["in"] += int(t.get("in", 0))
+        agg[p]["out"] += int(t.get("out", 0))
+        agg[p]["sec"] += float(t.get("sec", 0))
+        rate = costs.get(p, {})
+        usd_in = agg[p]["in"]  * float(rate.get("in_per_million", 0))  / 1_000_000
+        usd_out = agg[p]["out"] * float(rate.get("out_per_million", 0)) / 1_000_000
+        agg[p]["usd"] = usd_in + usd_out
+    return [{"provider": k, **v} for k, v in sorted(agg.items(), key=lambda kv: -kv[1]["usd"])]
+
+
+def recent_errors(events: list[dict], limit: int = 5) -> list[dict]:
+    """Most-recent error records, newest first."""
+    errs = [e for e in events if e.get("last_error")]
+    errs.sort(key=lambda r: r["_ts"], reverse=True)
+    out = []
+    for e in errs[:limit]:
+        out.append({
+            "ts": e["_ts"].strftime("%Y-%m-%d %H:%M"),
+            "project": e.get("project", "?"),
+            "step": e.get("step", "?"),
+            "error": str(e.get("last_error"))[:60],
+        })
+    return out
+
+
+# ---------- rendering ----------
+
+def render(projects, events, tokens, costs, now, since) -> str:
+    lines: list[str] = []
+    window_days = (now - since).days
+
+    by_status: Counter[str] = Counter()
+    proj_by_status: dict[str, list[str]] = defaultdict(list)
+    for s in projects:
+        status = "error" if s.get("last_error") else s.get("current_step", "?")
+        by_status[status] += 1
+        proj_by_status[status].append(s["project"])
+
+    lines.append(f"Projects ({len(projects)}):")
+    for status in ("done", "implement", "plan", "verify", "scaffold", "error"):
+        names = proj_by_status.get(status)
+        if names:
+            lines.append(f"  {status:10} {', '.join(names)}")
+    lines.append("")
+
+    # Step outcomes
+    outcomes = step_outcomes(events)
+    durs = step_durations(projects)
+    lines.append(f"Pipeline (last {window_days}d):")
+    lines.append(f"  {'step':12} {'runs':>4} {'ok':>4} {'err':>4} {'median':>8}")
+    for s in STEPS:
+        o = outcomes[s]
+        med = statistics.median(durs[s]) if durs.get(s) else 0
+        med_s = f"{int(med)}s" if med < 120 else f"{int(med/60)}m"
+        lines.append(f"  {s:12} {o['runs']:>4} {o['ok']:>4} {o['err']:>4} {med_s:>8}")
+    lines.append("")
+
+    # Provider summary
+    psum = provider_summary(tokens, costs)
+    if psum:
+        lines.append("Providers (last {}d, by spend):".format(window_days))
+        lines.append(f"  {'provider':10} {'calls':>6} {'in_tok':>8} {'out_tok':>8} {'usd':>10}")
+        for p in psum:
+            lines.append(
+                f"  {p['provider']:10} {p['calls']:>6} {p['in']:>8} {p['out']:>8} "
+                f"{p['usd']:>10.4f}"
+            )
+        lines.append("")
+
+    # Recent errors
+    errs = recent_errors(events, limit=5)
+    if errs:
+        lines.append("Recent errors:")
+        for e in errs:
+            lines.append(f"  {e['ts']}  {e['project']:20} {e['step']:10} {e['error']}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--days", type=int, default=7, help="window in days (default 7)")
+    ap.add_argument("--json", action="store_true", help="emit JSON instead of text")
+    args = ap.parse_args()
+
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(days=args.days)
+
+    projects = collect_projects()
+    events = collect_state_events(since)
+    tokens = collect_tokens(since)
+    costs_path = ROOT / "logs" / "costs.json"
+    costs = json.loads(costs_path.read_text()) if costs_path.exists() else {}
+
+    if args.json:
+        payload = {
+            "generated_at": now.isoformat(),
+            "window_days": args.days,
+            "projects": [
+                {"project": s["project"], "current_step": s.get("current_step"),
+                 "last_error": s.get("last_error")}
+                for s in projects
+            ],
+            "step_outcomes": step_outcomes(events),
+            "step_median_seconds": {
+                s: int(statistics.median(v)) if v else 0
+                for s, v in step_durations(projects).items()
+            },
+            "providers": provider_summary(tokens, costs),
+            "recent_errors": recent_errors(events, limit=10),
+        }
+        json.dump(payload, sys.stdout, indent=2, default=str)
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(render(projects, events, tokens, costs, now, since))
+
+
+if __name__ == "__main__":
+    main()

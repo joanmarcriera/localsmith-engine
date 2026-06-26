@@ -7,9 +7,8 @@
 # Local model / provider caches
 .playwright-mcp/
 
-# Generated project output and run state
-projects/*/state.json
-projects/*/src/
+# Generated project output and run state (orchestrator writes here at runtime)
+projects/
 logs/*.jsonl
 logs/*.json
 

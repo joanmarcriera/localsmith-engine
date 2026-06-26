@@ -1,0 +1,4 @@
+# Phase 1 is stdlib-only by design (urllib.request, argparse, json, subprocess).
+# Phase 3 will add:
+#   tenacity     # retry with exponential backoff + jitter
+#   jsonschema   # validate Ollama JSON output before touching disk

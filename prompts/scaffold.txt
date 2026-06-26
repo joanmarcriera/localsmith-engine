@@ -1,0 +1,22 @@
+You are a scaffolding generator. Read the project idea in this prompt and return
+ONLY a JSON object matching this schema (no prose, no markdown fences):
+
+{
+  "project": "<kebab-case slug, max 64 chars>",
+  "summary": "<one sentence, max 280 chars>",
+  "paths": [
+    "README.md",
+    "path/to/file.ext",
+    "path/to/directory/"
+  ]
+}
+
+Rules:
+- Directories MUST end with "/". Files MUST NOT end with "/".
+- Paths are POSIX-relative. No leading "/", no "..", no spaces.
+- Include only files that are necessary for the project. Empty stubs are fine.
+- Follow the engineering preferences from the system prompt unless the project idea
+  explicitly overrides them.
+- Match constraints in the project idea (e.g. "no build step" → no package.json).
+- Minimum 3 paths, maximum 200.
+- Output MUST be valid JSON. Nothing else.

@@ -1,0 +1,444 @@
+#!/usr/bin/env python3
+"""ai — unified dispatcher across local + cloud LLMs.
+
+Usage:
+  ai PROVIDER PROMPT
+  ai PROVIDER -                 # read prompt from stdin
+  echo "hi" | bin/ai zai -
+
+Providers
+  claude    Anthropic Claude via `claude -p` CLI    (Pro quota, no marginal $)
+  codex     OpenAI Codex via `codex exec` CLI       (Plus quota, no marginal $)
+  zai       Z.AI GLM via Anthropic-compat REST      (uses $ZAI_API_KEY)
+  ollama    Remote Ollama via REST                  ($OLLAMA_HOST, $OLLAMA_MODEL)
+  lmstudio  Local LM Studio via OpenAI-compat REST  ($LMSTUDIO_HOST, $LMSTUDIO_MODEL)
+  fixture   Deterministic local fixtures for smoke tests ($AI_FIXTURE_ROOT)
+
+Every call appends one JSONL line to $LOG_FILE (default ../logs/tokens.jsonl).
+Token counts are exact when the provider returns them, else char/4 estimate.
+
+Stdlib only — no pip install required.
+"""
+
+# pylint: disable=missing-function-docstring
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+# ---------- .env loader (supports bash 'export KEY=value') ----------
+
+def load_env() -> None:
+    """Populate os.environ from $ROOT/.env if present.
+
+    Accepts both `KEY=value` and `export KEY=value`. Existing env vars win.
+    """
+    env_path = ROOT / ".env"
+    if not env_path.exists():
+        return
+    for raw in env_path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):]
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        val = val.strip().strip('"').strip("'")
+        os.environ.setdefault(key.strip(), val)
+
+
+# ---------- cost table (USD per 1M tokens, rough 2026 estimate) ----------
+# Subscription-covered paths report 0.0 — real spend lives in your account dashboard.
+COSTS: dict[str, tuple[float, float]] = {
+    "claude":   (0.0, 0.0),   # Pro plan
+    "codex":    (0.0, 0.0),   # Plus plan
+    "zai":      (0.6, 2.2),   # GLM-4.6 indicative; Coding Lite is flat-rate anyway
+    "ollama":   (0.0, 0.0),   # local
+    "lmstudio": (0.0, 0.0),   # local
+    "fixture":  (0.0, 0.0),   # deterministic tests
+}
+
+MODEL_DEFAULTS: dict[str, str] = {
+    "claude":   "claude-pro-cli",
+    "codex":    "codex-plus-cli",
+    "zai":      "glm-4.6",
+    "ollama":   "qwen2.5-coder:14b",
+    "lmstudio": "google/gemma-4-31b",
+    "fixture":  "fixture",
+}
+
+MODEL_OVERRIDE_PROVIDERS = {"zai", "ollama", "lmstudio"}
+ENV_PREFIX_ALIASES = {
+    "lmstudio": ["LMSTUDIO", "LM_STUDIO"],
+}
+
+
+def resolve_log_path() -> pathlib.Path:
+    """Resolve LOG_FILE after .env loading; relative values are workflow-rooted."""
+    raw = os.getenv("LOG_FILE")
+    if not raw:
+        return ROOT / "logs" / "tokens.jsonl"
+    p = pathlib.Path(raw)
+    return p if p.is_absolute() else ROOT / p
+
+
+def _role_candidates() -> list[str]:
+    raw = os.getenv("AIWF_STEP", "").strip()
+    if not raw:
+        return []
+    role = raw.replace("-", "_").upper()
+    out = [role]
+    aliases = {
+        "IMPLEMENT": ["IMPL"],
+        "VERIFY": ["REVIEW"],
+    }
+    out.extend(aliases.get(role, []))
+    return out
+
+
+def select_model(provider: str, override: str | None = None) -> str:
+    """Pick model with CLI override, role-specific env, provider env, then default."""
+    if override:
+        return override
+    prefixes = ENV_PREFIX_ALIASES.get(provider, [provider.upper()])
+    for role in _role_candidates():
+        for prefix in prefixes:
+            for key in (f"{prefix}_{role}_MODEL", f"{role}_MODEL"):
+                if val := os.getenv(key):
+                    return val
+    for prefix in prefixes:
+        if val := os.getenv(f"{prefix}_MODEL"):
+            return val
+    return MODEL_DEFAULTS[provider]
+
+
+def _emit_costs_snapshot() -> None:
+    """Write costs.json beside the active token log for downstream tools.
+
+    Called once per process. Cheap provider-rate bookkeeping.
+    """
+    snapshot = resolve_log_path().parent / "costs.json"
+    try:
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_text(json.dumps(
+            {p: {"in_per_million": c[0], "out_per_million": c[1]} for p, c in COSTS.items()},
+            indent=2,
+        ) + "\n")
+    except Exception:
+        pass  # never fail a call because of bookkeeping
+
+
+def _cost(provider: str, p_in: int, p_out: int) -> float:
+    c_in, c_out = COSTS.get(provider, (0.0, 0.0))
+    return (p_in * c_in + p_out * c_out) / 1_000_000
+
+
+def usage_record(provider: str, model: str, p_in: int, p_out: int, usd: float, sec: float) -> dict:
+    """Build one stable-shape usage record. tokens.awk reads the base fields."""
+    rec = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "provider": provider,
+        "model": model,
+        "in": p_in,
+        "out": p_out,
+        "usd": round(usd, 6),
+        "sec": round(sec, 3),
+    }
+    if project := os.getenv("AIWF_PROJECT"):
+        rec["project"] = project
+    if step := os.getenv("AIWF_STEP"):
+        rec["step"] = step
+    return rec
+
+
+def _log(path: pathlib.Path, rec: dict) -> None:
+    """Append one stable-shape JSONL record."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def _approx_tokens(text: str) -> int:
+    """Cheap fallback when a provider doesn't return usage."""
+    return max(1, len(text) // 4)
+
+
+# ---------- providers ----------
+# Provider signature: fn(prompt, system, json_mode, model) -> (text, in_tokens, out_tokens).
+# system: optional system/persona prompt. json_mode: ask provider to constrain output to JSON.
+
+def _post_json(url: str, payload: dict, headers: dict, timeout: int = 600) -> dict:
+    """POST JSON, return parsed response. Centralised to keep providers terse."""
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", **headers},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+def _cli_prompt(system: str | None, prompt: str, json_mode: bool) -> str:
+    """Fold system + json instructions into a single string for CLI providers."""
+    parts = []
+    if system:
+        parts.append(f"[system]\n{system}\n")
+    if json_mode:
+        parts.append("[system]\nReply with valid JSON only. No prose, no markdown fences.\n")
+    parts.append(prompt if not system and not json_mode else f"[user]\n{prompt}")
+    return "\n".join(parts)
+
+
+def call_claude(prompt: str, system: str | None, json_mode: bool, model: str) -> tuple[str, int, int]:
+    """Subprocess `claude -p`. Uses Claude Pro session login."""
+    del model
+    full = _cli_prompt(system, prompt, json_mode)
+    proc = subprocess.run(["claude", "-p", full], capture_output=True, text=True, check=True)
+    return proc.stdout, _approx_tokens(full), _approx_tokens(proc.stdout)
+
+
+def call_codex(prompt: str, system: str | None, json_mode: bool, model: str) -> tuple[str, int, int]:
+    """Subprocess `codex exec`. Uses ChatGPT Plus session login."""
+    del model
+    full = _cli_prompt(system, prompt, json_mode)
+    proc = subprocess.run(["codex", "exec", full], capture_output=True, text=True, check=True)
+    return proc.stdout, _approx_tokens(full), _approx_tokens(proc.stdout)
+
+
+def call_zai(prompt: str, system: str | None, json_mode: bool, model: str) -> tuple[str, int, int]:
+    """POST to Z.AI Anthropic-compatible endpoint (Coding Lite quota path).
+
+    Anthropic API supports a top-level 'system' field. No native JSON mode, so when
+    json_mode is set we prepend a system instruction — same pattern Anthropic recommends.
+    """
+    key = os.environ.get("ZAI_API_KEY")
+    if not key:
+        sys.exit("[ai] ZAI_API_KEY not set (export in .env)")
+    body: dict = {
+        "model": model,
+        "max_tokens": int(os.getenv("ZAI_MAX_TOKENS", "4096")),
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    sys_parts = []
+    if system:
+        sys_parts.append(system)
+    if json_mode:
+        sys_parts.append("Reply with valid JSON only. No prose, no markdown fences.")
+    if sys_parts:
+        body["system"] = "\n\n".join(sys_parts)
+    data = _post_json(
+        "https://api.z.ai/api/anthropic/v1/messages", body,
+        {"x-api-key": key, "anthropic-version": "2023-06-01"}, timeout=120,
+    )
+    text = "".join(b.get("text", "") for b in data.get("content", []))
+    usage = data.get("usage", {})
+    return text, int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0))
+
+
+def call_ollama(prompt: str, system: str | None, json_mode: bool, model: str) -> tuple[str, int, int]:
+    """POST to remote Ollama /api/generate (non-streaming).
+
+    Native fields: 'system' for persona, 'format'="json" for JSON-grammar-constrained output.
+    """
+    host = os.getenv("OLLAMA_HOST", "http://192.168.0.5:30068")
+    body: dict = {"model": model, "prompt": prompt, "stream": False}
+    if system:
+        body["system"] = system
+    if json_mode:
+        body["format"] = "json"
+    data = _post_json(f"{host}/api/generate", body, {})
+    return (
+        data.get("response", ""),
+        int(data.get("prompt_eval_count", 0)),
+        int(data.get("eval_count", 0)),
+    )
+
+
+def call_lmstudio(prompt: str, system: str | None, json_mode: bool, model: str) -> tuple[str, int, int]:
+    """POST to LM Studio via OpenAI-compatible /v1/chat/completions.
+
+    Deliberately OpenAI-compat (not LM-Studio-native /api/v1/chat) so the same call
+    works against llama.cpp's `llama-server` later — only LMSTUDIO_HOST changes.
+    JSON mode uses response_format={'type':'json_object'} (supported by both).
+    """
+    host = os.getenv("LMSTUDIO_HOST") or os.getenv("LM_STUDIO_HOST") or "http://localhost:1234"
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    body: dict = {"model": model, "messages": messages}
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+    data = _post_json(f"{host}/v1/chat/completions", body, {})
+    text = data["choices"][0]["message"]["content"]
+    usage = data.get("usage", {})
+    return text, int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0))
+
+
+def _fixture_root() -> pathlib.Path:
+    raw = os.getenv("AI_FIXTURE_ROOT")
+    if not raw:
+        sys.exit("[ai fixture] AI_FIXTURE_ROOT not set")
+    root = pathlib.Path(raw)
+    return root if root.is_absolute() else ROOT / root
+
+
+def _fixture_project_dir() -> pathlib.Path:
+    project = os.getenv("AIWF_PROJECT", "").strip()
+    if not project:
+        sys.exit("[ai fixture] AIWF_PROJECT not set")
+    return _fixture_root() / project
+
+
+def _safe_fixture_relpath(prompt: str) -> pathlib.PurePosixPath:
+    marker = "--- FILE TO IMPLEMENT ---"
+    if marker not in prompt:
+        sys.exit("[ai fixture] implement prompt missing file marker")
+    after = prompt.split(marker, 1)[1].lstrip()
+    rel = after.splitlines()[0].strip()
+    if not rel:
+        sys.exit("[ai fixture] implement prompt did not include a target path")
+    path = pathlib.PurePosixPath(rel)
+    if path.is_absolute() or ".." in path.parts:
+        sys.exit(f"[ai fixture] unsafe fixture file path: {rel}")
+    return path
+
+
+def _read_fixture_file(path: pathlib.Path) -> str:
+    try:
+        return path.read_text()
+    except FileNotFoundError:
+        sys.exit(f"[ai fixture] missing fixture: {path}")
+
+
+def call_fixture(prompt: str, system: str | None, json_mode: bool, model: str) -> tuple[str, int, int]:
+    """Return deterministic responses for end-to-end workflow smoke tests.
+
+    Fixture layout:
+      $AI_FIXTURE_ROOT/<project>/tree.json
+      $AI_FIXTURE_ROOT/<project>/plan.json
+      $AI_FIXTURE_ROOT/<project>/files/<task path>
+      $AI_FIXTURE_ROOT/<project>/review.txt          optional, defaults to OK
+    """
+    del json_mode, model
+    step = os.getenv("AIWF_STEP", "").strip()
+    project_dir = _fixture_project_dir()
+    if step == "scaffold":
+        text = _read_fixture_file(project_dir / "tree.json")
+    elif step == "plan":
+        text = _read_fixture_file(project_dir / "plan.json")
+    elif step == "implement":
+        rel = _safe_fixture_relpath(prompt)
+        text = _read_fixture_file(project_dir / "files" / rel)
+    elif step == "verify":
+        review = project_dir / "review.txt"
+        text = review.read_text() if review.exists() else "OK\n"
+    else:
+        sys.exit(f"[ai fixture] unsupported AIWF_STEP: {step or '(empty)'}")
+
+    full_prompt = _cli_prompt(system, prompt, json_mode=False)
+    return text, _approx_tokens(full_prompt), _approx_tokens(text)
+
+
+PROVIDERS = {
+    "claude":   call_claude,
+    "codex":    call_codex,
+    "fixture":  call_fixture,
+    "zai":      call_zai,
+    "ollama":   call_ollama,
+    "lmstudio": call_lmstudio,
+}
+
+
+# ---------- CLI ----------
+
+def main() -> None:
+    load_env()
+    _emit_costs_snapshot()
+    ap = argparse.ArgumentParser(
+        description="Unified LLM dispatcher (see file docstring for details).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("provider", choices=sorted(PROVIDERS))
+    ap.add_argument("prompt", help="prompt text, or '-' to read from stdin")
+    ap.add_argument("--system", "-s", default=None,
+                    help="system/persona prompt (or @file to read from disk)")
+    ap.add_argument("--json", "-j", action="store_true",
+                    help="ask the provider to constrain output to a JSON object")
+    ap.add_argument("--model", "-m", default=None,
+                    help="model override for zai, ollama, and lmstudio")
+    ap.add_argument("--usage-file", default=None,
+                    help="write the usage record JSON to this path after the call")
+    args = ap.parse_args()
+
+    if args.model and args.provider not in MODEL_OVERRIDE_PROVIDERS:
+        sys.exit(f"[ai] --model is only supported for: {', '.join(sorted(MODEL_OVERRIDE_PROVIDERS))}")
+
+    prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
+    if not prompt.strip():
+        sys.exit("[ai] empty prompt")
+
+    system = args.system
+    if system and system.startswith("@"):
+        system = pathlib.Path(system[1:]).read_text()
+
+    fn = PROVIDERS[args.provider]
+    model_name = select_model(args.provider, args.model)
+    t0 = time.time()
+    try:
+        text, p_in, p_out = fn(prompt, system, args.json, model_name)
+    except subprocess.CalledProcessError as exc:
+        details = "\n".join(
+            part for part in (exc.stderr.strip(), exc.stdout.strip()) if part
+        )
+        if not details:
+            details = "(no stdout/stderr from CLI)"
+        sys.stderr.write(f"[ai] {args.provider} CLI failed (rc={exc.returncode}):\n{details}\n")
+        sys.exit(exc.returncode or 1)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(errors="replace")
+        sys.stderr.write(f"[ai] {args.provider} HTTP {exc.code}: {body}\n")
+        sys.exit(1)
+    except urllib.error.URLError as exc:
+        sys.stderr.write(f"[ai] {args.provider} network error: {exc.reason}\n")
+        sys.exit(1)
+    elapsed = time.time() - t0
+
+    rec = usage_record(args.provider, model_name, p_in, p_out, _cost(args.provider, p_in, p_out), elapsed)
+    _log(resolve_log_path(), rec)
+    if args.usage_file:
+        usage_path = pathlib.Path(args.usage_file)
+        usage_path.parent.mkdir(parents=True, exist_ok=True)
+        usage_path.write_text(json.dumps(rec, indent=2) + "\n")
+
+    # In JSON mode, strip optional ``` / ```json fences some models add despite instructions.
+    if args.json:
+        stripped = text.strip()
+        if stripped.startswith("```"):
+            # remove leading fence line (```json or ```) and trailing fence
+            lines = stripped.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines) + "\n"
+
+    sys.stdout.write(text)
+    if not text.endswith("\n"):
+        sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()

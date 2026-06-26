@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""search — local-first search helper with Brave Search fallback.
+
+WHAT: Queries a search backend (SearXNG on the LAN by default, Brave Search API as
+fallback) and prints compact markdown or JSON results. Used to ground prompts
+before spending cloud-LLM quota.
+
+WHY: SearXNG is private and free but flaky over LAN. Brave Search has a generous
+free tier (2000 req/month) and is reliable, but it's a third-party request — we
+prefer the LAN when it works. The `auto` backend tries SearXNG first and falls
+back to Brave on any failure or empty result.
+
+KEY DECISIONS:
+- Stdlib only. No `requests`, no `brave-search-python-client`.
+- BRAVE_API_SEARCH env is the auth key (matches what's in `.env`).
+- Normalised result shape across backends: {title, url, content, engine}.
+- `auto` is the default: behaves like SearXNG when it works, like Brave when not.
+
+Usage:
+  bin/search "query terms"
+  bin/search "query" --backend brave
+  bin/search "query" --backend searxng
+  bin/search "query" --limit 3 --json
+
+Env:
+  SEARXNG_HOST       default http://192.168.0.5:30053
+  BRAVE_API_SEARCH   required for the brave backend
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+DEFAULT_SEARXNG_HOST = "http://192.168.0.5:30053"
+BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+
+
+def load_env() -> None:
+    env_path = ROOT / ".env"
+    if not env_path.exists():
+        return
+    for raw in env_path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):]
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+
+# ---------- SearXNG backend ----------
+
+def searxng_host(override: str | None = None) -> str:
+    return (override or os.getenv("SEARXNG_HOST") or DEFAULT_SEARXNG_HOST).rstrip("/")
+
+
+def build_search_url(query: str, *, host: str | None = None, language: str = "en") -> str:
+    """Public SearXNG URL builder — kept for backward compat with existing tests
+    that probe the default LAN endpoint shape."""
+    params = {"q": query, "format": "json", "language": language}
+    return f"{searxng_host(host)}/search?{urllib.parse.urlencode(params)}"
+
+
+def searxng_search(query: str, *, host: str, limit: int, timeout: int) -> list[dict]:
+    """Returns normalised results. Raises on any failure (caller decides fallback)."""
+    req = urllib.request.Request(
+        build_search_url(query, host=host),
+        headers={"User-Agent": "ai-workflow/1.0"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        payload = json.loads(resp.read())
+    rows = []
+    for item in payload.get("results", [])[:limit]:
+        rows.append({
+            "title":   (item.get("title")   or "").strip(),
+            "url":     (item.get("url")     or "").strip(),
+            "content": (item.get("content") or "").strip(),
+            "engine":  item.get("engine", "searxng"),
+        })
+    return rows
+
+
+# ---------- Brave Search backend ----------
+
+def brave_search(query: str, *, limit: int, timeout: int) -> list[dict]:
+    """Brave Search Web API. Requires BRAVE_API_SEARCH env."""
+    key = os.environ.get("BRAVE_API_SEARCH")
+    if not key:
+        raise RuntimeError("BRAVE_API_SEARCH not set in .env or shell")
+    # Brave 'count' max is 20; we cap at the user-requested limit.
+    params = {"q": query, "count": str(min(max(limit, 1), 20))}
+    req = urllib.request.Request(
+        f"{BRAVE_ENDPOINT}?{urllib.parse.urlencode(params)}",
+        headers={
+            "Accept": "application/json",
+            "X-Subscription-Token": key,
+            "User-Agent": "ai-workflow/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        payload = json.loads(resp.read())
+    rows = []
+    web = payload.get("web") or {}
+    for item in (web.get("results") or [])[:limit]:
+        rows.append({
+            "title":   (item.get("title")       or "").strip(),
+            "url":     (item.get("url")         or "").strip(),
+            "content": (item.get("description") or "").strip(),
+            "engine":  "brave",
+        })
+    return rows
+
+
+# ---------- backend dispatcher ----------
+
+def do_search(query: str, backend: str, *, host: str | None, limit: int, timeout: int) -> tuple[list[dict], str, list[str]]:
+    """Run a search, returning (results, backend_used, notes_about_fallbacks).
+
+    backend in {"auto", "searxng", "brave"}.
+    "auto" tries SearXNG first; on failure or empty result, falls back to Brave.
+    """
+    notes: list[str] = []
+    if backend == "searxng":
+        return searxng_search(query, host=searxng_host(host), limit=limit, timeout=timeout), "searxng", notes
+    if backend == "brave":
+        return brave_search(query, limit=limit, timeout=timeout), "brave", notes
+    if backend == "auto":
+        try:
+            results = searxng_search(query, host=searxng_host(host), limit=limit, timeout=timeout)
+            if results:
+                return results, "searxng", notes
+            notes.append("searxng returned 0 results; trying brave")
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            notes.append(f"searxng failed ({type(exc).__name__}); trying brave")
+        return brave_search(query, limit=limit, timeout=timeout), "brave", notes
+    raise ValueError(f"unknown backend: {backend}")
+
+
+# ---------- rendering ----------
+
+def render_markdown(query: str, results: list[dict], backend: str, notes: list[str]) -> str:
+    lines = [f"# Search: {query}", "", f"_backend: {backend}_"]
+    for n in notes:
+        lines.append(f"_{n}_")
+    lines.append("")
+    if not results:
+        lines.append("_No results returned._")
+        return "\n".join(lines) + "\n"
+    for idx, item in enumerate(results, 1):
+        title = item["title"] or item["url"] or "(untitled)"
+        lines.append(f"{idx}. {title}")
+        if item["url"]:
+            lines.append(f"   {item['url']}")
+        if item["content"]:
+            lines.append(f"   {item['content']}")
+        if item["engine"]:
+            lines.append(f"   engine: {item['engine']}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def main() -> None:
+    load_env()
+    ap = argparse.ArgumentParser(description="Local-first search (SearXNG → Brave fallback).")
+    ap.add_argument("query")
+    ap.add_argument("--backend", choices=["auto", "searxng", "brave"], default="auto")
+    ap.add_argument("--host", default=None, help="override SearXNG host (searxng/auto only)")
+    ap.add_argument("--limit", type=int, default=5)
+    ap.add_argument("--timeout", type=int, default=10)
+    ap.add_argument("--json", action="store_true", help="emit compact JSON")
+    args = ap.parse_args()
+
+    if args.limit < 1:
+        sys.exit("[search] --limit must be >= 1")
+
+    try:
+        results, used, notes = do_search(
+            args.query, args.backend,
+            host=args.host, limit=args.limit, timeout=args.timeout,
+        )
+    except RuntimeError as exc:
+        sys.exit(f"[search] {exc}")
+    except Exception as exc:
+        sys.exit(f"[search] {args.backend} failed: {exc}")
+
+    if args.json:
+        out = {
+            "query": args.query,
+            "backend": used,
+            "notes": notes,
+            "results": results,
+        }
+        json.dump(out, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(render_markdown(args.query, results, used, notes))
+
+
+if __name__ == "__main__":
+    main()

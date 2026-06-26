@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "state.schema.json",
+  "title": "Per-project workflow state",
+  "description": "Append-only-ish state machine. orchestrate.sh reads next_step, runs it, writes back.",
+  "type": "object",
+  "required": ["project", "idea_path", "steps", "current_step", "completed", "tokens"],
+  "additionalProperties": false,
+  "properties": {
+    "project":     {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
+    "idea_path":   {"type": "string"},
+    "created_at":  {"type": "string"},
+    "updated_at":  {"type": "string"},
+    "steps":       {
+      "type": "array",
+      "minItems": 1,
+      "items": {"enum": ["scaffold", "plan", "implement", "verify", "done"]}
+    },
+    "current_step": {"enum": ["scaffold", "plan", "implement", "verify", "done"]},
+    "completed":    {
+      "type": "array",
+      "items": {"enum": ["scaffold", "plan", "implement", "verify"]},
+      "uniqueItems": true
+    },
+    "outputs": {
+      "type": "object",
+      "description": "Per-step output file paths (relative to project dir).",
+      "additionalProperties": {"type": "string"}
+    },
+    "tokens": {
+      "type": "object",
+      "description": "Cumulative token counters per provider, for quick rollup.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["in", "out"],
+        "properties": {
+          "in":  {"type": "integer", "minimum": 0},
+          "out": {"type": "integer", "minimum": 0}
+        }
+      }
+    },
+    "step_entered_at": {
+      "type": "object",
+      "description": "First timestamp observed for each workflow step.",
+      "additionalProperties": {"type": "string"}
+    },
+    "last_error": {"type": ["string", "null"]}
+  }
+}

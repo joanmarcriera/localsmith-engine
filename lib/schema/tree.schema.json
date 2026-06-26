@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "tree.schema.json",
+  "title": "Project file tree",
+  "description": "Flat list of POSIX-relative paths to create. Directories end with '/'. Files do not.",
+  "type": "object",
+  "required": ["project", "paths"],
+  "additionalProperties": false,
+  "properties": {
+    "project": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+      "description": "kebab-case project slug"
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 280
+    },
+    "paths": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 200,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200,
+        "pattern": "^[A-Za-z0-9._-][A-Za-z0-9._/-]*/?$",
+        "description": "Relative path. No leading '/', no '..', trailing '/' marks a directory."
+      },
+      "uniqueItems": true
+    }
+  }
+}
