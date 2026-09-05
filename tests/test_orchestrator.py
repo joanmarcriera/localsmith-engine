@@ -11,6 +11,8 @@ WHAT: Tests covering the parts most likely to regress silently:
   6. bin/search — default SearXNG endpoint construction.
   7. WorkflowSmokeTest — three fixture-backed projects that run the real
      scaffold, plan, implement, and verify scripts end to end.
+  8. bin/license.sh — Pro license activate/validate/status/deactivate against
+     a fake curl shim, including the offline-grace path.
 
 WHY: We learned the hard way that silent failures here cost real tokens later.
 These tests run in <1s, hit no network, and burn no API quota — fast enough to
@@ -746,6 +748,35 @@ exit 1
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(value_path.read_text().strip(), "from_shell")
 
+    def test_batch_continues_past_a_failed_project_and_completes_the_rest(self) -> None:
+        """`orchestrate.sh queue/*.md` must not let one bad project abort the batch."""
+        (self.tmp / "bin" / "verify.sh").write_text("""#!/usr/bin/env bash
+pd="$1"
+slug="$(basename "$pd")"
+if [ "$slug" = "failing-project" ]; then
+    exit 1
+fi
+printf '{"current_step":"done"}\\n' > "$pd/state.json"
+exit 0
+""")
+        os.chmod(self.tmp / "bin" / "verify.sh", 0o755)
+        (self.tmp / "queue" / "passing-project.md").write_text("# Project - passing-project\n")
+
+        proc = _run(
+            [
+                str(self.tmp / "bin" / "orchestrate.sh"),
+                str(self.tmp / "queue" / "failing-project.md"),
+                str(self.tmp / "queue" / "passing-project.md"),
+            ],
+            cwd=str(self.tmp),
+        )
+        self.assertNotEqual(proc.returncode, 0, msg=f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        self.assertIn("failing-project: verify failed, state preserved", proc.stderr)
+        self.assertIn("continuing to next project", proc.stderr)
+        self.assertIn("passing-project: complete", proc.stderr)
+        state = json.loads((self.tmp / "projects" / "passing-project" / "state.json").read_text())
+        self.assertEqual(state["current_step"], "done")
+
 
 class SearchBackendTest(unittest.TestCase):
     """bin/search dispatcher: auto must prefer SearXNG, fall back to Brave."""
@@ -807,6 +838,136 @@ class SearchBackendTest(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             self.mod.brave_search("q", limit=1, timeout=1)
         self.assertIn("BRAVE_API_SEARCH", str(ctx.exception))
+
+
+class LicenseGateTest(unittest.TestCase):
+    """bin/license.sh: Lemon Squeezy Pro gate, offline grace, and seat lifecycle.
+
+    A fake `curl` shim on PATH stands in for the real Lemon Squeezy API so
+    these tests hit no network and burn no license seats.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="aiwf-license-"))
+        self.addCleanup(shutil.rmtree, self.tmp)
+        fake_bin = self.tmp / "fakebin"
+        fake_bin.mkdir()
+        curl_stub = fake_bin / "curl"
+        curl_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ -n "${FAKE_CURL_LOG:-}" ]; then printf \'%s\\n\' "$*" >> "$FAKE_CURL_LOG"; fi\n'
+            'if [ -n "${FAKE_CURL_EMPTY:-}" ]; then exit "${FAKE_CURL_EXIT:-0}"; fi\n'
+            'printf \'%s\' "${FAKE_CURL_RESPONSE:-{\\}}"\n'
+            'exit "${FAKE_CURL_EXIT:-0}"\n'
+        )
+        curl_stub.chmod(0o755)
+        self.fake_bin = fake_bin
+        self.license_file = self.tmp / ".license"
+        self.curl_log = self.tmp / "curl.log"
+
+    def _run_license(
+        self, *args: str, response: str = "{}", empty: bool = False, exit_code: int = 0
+    ) -> subprocess.CompletedProcess:
+        env = {
+            **os.environ,
+            "PATH": f"{self.fake_bin}:{os.environ['PATH']}",
+            "LOCALSMITH_LICENSE_FILE": str(self.license_file),
+            "FAKE_CURL_LOG": str(self.curl_log),
+            "FAKE_CURL_RESPONSE": response,
+            "FAKE_CURL_EXIT": str(exit_code),
+        }
+        if empty:
+            env["FAKE_CURL_EMPTY"] = "1"
+        return _run([str(BIN / "license.sh"), *args], env=env)
+
+    def test_status_reports_free_tier_when_no_license_file(self) -> None:
+        proc = self._run_license("status")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("Free tier", proc.stdout)
+
+    def test_validate_exits_2_when_no_license_file(self) -> None:
+        proc = self._run_license("validate")
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+
+    def test_activate_writes_license_file_with_key_and_instance_id(self) -> None:
+        proc = self._run_license(
+            "activate",
+            "LIC-123",
+            response=json.dumps({"activated": True, "instance": {"id": "inst-abc"}}),
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        self.assertIn("Pro activated", proc.stdout)
+        content = self.license_file.read_text()
+        self.assertIn("key=LIC-123", content)
+        self.assertIn("instance_id=inst-abc", content)
+
+    def test_activate_sets_restrictive_file_permissions(self) -> None:
+        self._run_license(
+            "activate",
+            "LIC-123",
+            response=json.dumps({"activated": True, "instance": {"id": "inst-abc"}}),
+        )
+        mode = self.license_file.stat().st_mode & 0o777
+        self.assertEqual(oct(mode), oct(0o600))
+
+    def test_activate_failure_reports_error_and_leaves_no_license_file(self) -> None:
+        proc = self._run_license(
+            "activate",
+            "BAD-KEY",
+            response=json.dumps({"activated": False, "error": "license_key_not_found"}),
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("license_key_not_found", proc.stdout)
+        self.assertFalse(self.license_file.exists())
+
+    def test_activate_without_key_argument_fails_fast(self) -> None:
+        proc = self._run_license("activate")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("usage", proc.stderr)
+        self.assertFalse(self.license_file.exists())
+
+    def test_validate_succeeds_for_valid_license(self) -> None:
+        self.license_file.write_text("key=LIC-123\ninstance_id=inst-abc\n")
+        proc = self._run_license("validate", response=json.dumps({"valid": True}))
+        self.assertEqual(proc.returncode, 0)
+
+    def test_status_reports_offline_grace_when_api_unreachable(self) -> None:
+        self.license_file.write_text("key=LIC-123\ninstance_id=inst-abc\n")
+        proc = self._run_license("status", empty=True)
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("offline", proc.stdout.lower())
+
+    def test_status_reverts_to_free_tier_when_license_invalid(self) -> None:
+        self.license_file.write_text("key=LIC-123\ninstance_id=inst-abc\n")
+        proc = self._run_license(
+            "status", response=json.dumps({"valid": False, "error": "expired"})
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("expired", proc.stdout)
+
+    def test_deactivate_removes_license_file(self) -> None:
+        self.license_file.write_text("key=LIC-123\ninstance_id=inst-abc\n")
+        proc = self._run_license("deactivate")
+        self.assertEqual(proc.returncode, 0)
+        self.assertFalse(self.license_file.exists())
+        self.assertIn("Seat released", proc.stdout)
+
+    def test_deactivate_without_license_file_is_a_noop(self) -> None:
+        proc = self._run_license("deactivate")
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("No license to deactivate", proc.stdout)
+
+    def test_deactivate_removes_file_even_when_api_is_unreachable(self) -> None:
+        self.license_file.write_text("key=LIC-123\ninstance_id=inst-abc\n")
+        proc = self._run_license("deactivate", empty=True, exit_code=7)
+        self.assertEqual(proc.returncode, 0)
+        self.assertFalse(self.license_file.exists())
+
+    def test_unknown_command_prints_usage_and_exits_nonzero(self) -> None:
+        proc = self._run_license("bogus")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("usage:", proc.stdout)
 
 
 if __name__ == "__main__":
