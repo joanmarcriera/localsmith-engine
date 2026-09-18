@@ -278,3 +278,8 @@ then the bash glue is genuinely simpler — see
    via the `claude` / `codex` CLIs, not raw REST.
 5. **`ls -1t | head -1` is not a slug**. Always derive project slug from the idea
    filename — `queue/<slug>.md` → `projects/<slug>/`.
+
+<!-- vikunja-tracking -->
+## Tracking
+
+Vikunja project **69 · Localsmith** — https://familia.riera.co.uk/projects/69
