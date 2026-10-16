@@ -1,4 +1,7 @@
-# Major-version dependency upgrades pending — 2026-09-06
+# Major-version dependency upgrades — url-shortener APPLIED 2026-10-16 (was pending 2026-09-06)
+
+Applied 2026-10-16: sqlite v1.58.0, libc v1.75.7, go-strftime v1.0.0; go build and go test pass (2 passed in 3 packages). projects/ is gitignored, so the go.mod change is local only.
+
 
 Routine minor/patch dependency sweep found nothing to apply in
 `projects/dashboard` (already current). In `projects/url-shortener`, the only
